@@ -77,11 +77,14 @@ class JobEngine:
         # Calculate ATS scores for each job (against all 3 roles, pick best)
         for job in sorted_jobs:
             description = job.get("description", "")
-            if description:
+            title = job.get("title", "")
+            if description or title:
                 try:
                     scores = {}
                     for role in ["Data Analyst", "Analytics Engineer", "Data Engineer"]:
-                        score, category, is_strong = calculate_ats_match_score(description, role, [])
+                        score, category, is_strong = calculate_ats_match_score(
+                            description, role, user_skills=[], job_title=title
+                        )
                         scores[role] = (score, category, is_strong)
 
                     best_role = max(scores, key=lambda r: scores[r][0])

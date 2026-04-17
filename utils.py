@@ -184,25 +184,60 @@ def infer_role_scores(text: str) -> dict[str, int]:
     return scores
 
 
-def calculate_ats_match_score(job_text: str, target_role: str, user_skills: list[str] = None) -> tuple[int, str, bool]:
+TITLE_ROLE_TOKENS = {
+    "Data Analyst": ["data analyst", "business analyst", "bi analyst", "analytics analyst", "product analyst", "marketing analyst"],
+    "Analytics Engineer": ["analytics engineer", "bi engineer", "analytics developer", "data modeler"],
+    "Data Engineer": ["data engineer", "etl engineer", "data platform", "data infrastructure", "data pipeline"],
+}
+
+
+def calculate_ats_match_score(
+    job_text: str,
+    target_role: str,
+    user_skills: list[str] = None,
+    job_title: str = "",
+) -> tuple[int, str, bool]:
     if user_skills is None:
         user_skills = []
 
     lower = job_text.lower()
+    title_lower = (job_title or "").lower()
     role_skills = ROLE_SKILL_MAP.get(target_role, [])
 
+    # 1. Title match — strongest signal (up to 40 pts)
+    title_score = 0
+    role_title_tokens = TITLE_ROLE_TOKENS.get(target_role, [target_role.lower()])
+    if any(phrase in title_lower for phrase in role_title_tokens):
+        title_score = 40
+    elif target_role.lower() in title_lower:
+        title_score = 35
+    else:
+        role_words = target_role.lower().split()
+        word_hits = sum(1 for w in role_words if w in title_lower and len(w) > 2)
+        if word_hits >= 2:
+            title_score = 20
+        elif word_hits == 1:
+            title_score = 8
+
+    # 2. Role-skill coverage in description (up to 30 pts)
     matched_count = sum(1 for skill in role_skills if skill in lower)
-    matched_score = matched_count * 15
+    skill_score = min(matched_count * 4, 30)
+    skill_coverage = matched_count / max(len(role_skills), 1)
 
-    role_scores = infer_role_scores(job_text)
-    role_fit = role_scores.get(target_role, 0)
-    role_bonus = min(role_fit * 3, 25)
+    # 3. User skills bonus (up to 15 pts)
+    user_skill_matches = sum(1 for s in user_skills if s.strip().lower() in lower) if user_skills else 0
+    user_bonus = min(user_skill_matches * 3, 15)
 
+    # 4. Core phrase / rare keyword boost (up to 15 pts)
     keywords = extract_keywords(job_text, top_n=30)
     rare_keyword_count = sum(1 for kw in keywords if kw in CORE_PHRASES)
-    keyword_boost = min(rare_keyword_count * 5, 20)
+    keyword_boost = min(rare_keyword_count * 2, 15)
 
-    raw_score = min(matched_score + role_bonus + keyword_boost, 100)
+    raw_score = min(title_score + skill_score + user_bonus + keyword_boost, 100)
+
+    # Penalty: title completely unrelated AND weak skill coverage
+    if title_score == 0 and skill_coverage < 0.2:
+        raw_score = int(raw_score * 0.5)
 
     if raw_score >= 81:
         category = "Excellent"

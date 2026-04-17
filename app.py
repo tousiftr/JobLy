@@ -331,8 +331,19 @@ def api_analyze() -> Any:
     role_scores = infer_role_scores(job_text)
     tailored = tailor_resume(job_text, role, user_skills)
 
-    # Calculate ATS match score
-    ats_score, ats_category, is_strong_match = calculate_ats_match_score(job_text, role, user_skills)
+    # Derive candidate title: explicit payload field wins, else first non-empty line
+    job_title = normalize_text(payload.get("job_title", ""))
+    if not job_title:
+        for line in job_text.splitlines():
+            line = line.strip()
+            if line and len(line) < 120:
+                job_title = line
+                break
+
+    # Calculate ATS match score (title + skills)
+    ats_score, ats_category, is_strong_match = calculate_ats_match_score(
+        job_text, role, user_skills, job_title=job_title
+    )
 
     result = {
         "ats_score": ats_score,
