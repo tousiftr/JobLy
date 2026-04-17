@@ -150,6 +150,50 @@ def infer_role_scores(text: str) -> dict[str, int]:
     return scores
 
 
+def calculate_ats_match_score(job_text: str, target_role: str, user_skills: list[str]) -> tuple[int, str, bool]:
+    """
+    Calculate ATS match score (0-100) based on job-to-profile fit.
+
+    Returns:
+        (score: int, category: str, is_strong_match: bool)
+        category: "Poor", "Fair", "Good", "Excellent"
+        is_strong_match: True if score >= 70
+    """
+    lower = job_text.lower()
+    role_skills = ROLE_SKILL_MAP.get(target_role, [])
+
+    # Count matched skills (each worth 15 points)
+    matched_count = sum(1 for skill in role_skills if skill in lower)
+    matched_score = matched_count * 15
+
+    # Role fit bonus (from infer_role_scores)
+    role_scores = infer_role_scores(job_text)
+    role_fit = role_scores.get(target_role, 0)
+    role_bonus = min(role_fit * 3, 25)  # Cap at 25 points
+
+    # Keyword rarity boost - count extracted keywords that are in CORE_PHRASES
+    keywords = extract_keywords(job_text, top_n=30)
+    rare_keyword_count = sum(1 for kw in keywords if kw in CORE_PHRASES)
+    keyword_boost = min(rare_keyword_count * 5, 20)  # Cap at 20 points
+
+    # Calculate raw score, cap at 100
+    raw_score = min(matched_score + role_bonus + keyword_boost, 100)
+
+    # Categorize
+    if raw_score >= 81:
+        category = "Excellent"
+    elif raw_score >= 61:
+        category = "Good"
+    elif raw_score >= 31:
+        category = "Fair"
+    else:
+        category = "Poor"
+
+    is_strong_match = raw_score >= 70
+
+    return raw_score, category, is_strong_match
+
+
 def tailor_resume(job_text: str, role: str, user_skills: list[str]) -> dict[str, Any]:
     lower = job_text.lower()
     role_skills = ROLE_SKILL_MAP.get(role, [])
@@ -293,7 +337,13 @@ def api_analyze() -> Any:
     role_scores = infer_role_scores(job_text)
     tailored = tailor_resume(job_text, role, user_skills)
 
+    # Calculate ATS match score
+    ats_score, ats_category, is_strong_match = calculate_ats_match_score(job_text, role, user_skills)
+
     result = {
+        "ats_score": ats_score,
+        "ats_category": ats_category,
+        "is_strong_match": is_strong_match,
         "keywords": kw,
         "role_scores": role_scores,
         "top_role": max(role_scores, key=role_scores.get),
@@ -301,9 +351,9 @@ def api_analyze() -> Any:
             "sql", "python", "dbt", "tableau", "power bi", "snowflake", "bigquery",
             "airflow", "spark", "aws", "gcp", "azure", "ga4", "gtm"
         }],
-        "remote_friendly": bool_from_text(job_text, ["remote", "global remote", "work from anywhere"]),
-        "visa_sponsorship": bool_from_text(job_text, ["visa sponsorship", "work permit", "sponsor"]),
-        "relocation_support": bool_from_text(job_text, ["relocation", "relocation support", "relocation assistance"]),
+        "remote_status": "Yes" if bool_from_text(job_text, ["remote", "global remote", "work from anywhere"]) else ("No" if bool_from_text(job_text, ["office", "on-site", "onsite"]) else "Not mentioned"),
+        "visa_sponsorship_status": "Yes" if bool_from_text(job_text, ["visa sponsorship", "work permit", "sponsor"]) else ("No" if bool_from_text(job_text, ["no visa", "visa not provided"]) else "Not mentioned"),
+        "relocation_support": "Yes" if bool_from_text(job_text, ["relocation", "relocation support", "relocation assistance"]) else ("No" if bool_from_text(job_text, ["no relocation"]) else "Not mentioned"),
         "tailoring": tailored,
         "analyzed_at": now_iso(),
         "source_url": job_url,
@@ -574,12 +624,29 @@ async function analyzeJob(){
   try{
     const d = await jfetch('/api/analyze', {method:'POST', body: JSON.stringify(payload)});
     latestAnalysis = d;
+
+    // Determine ATS score badge color
+    let scoreColor = '#dc2626'; // Red (Poor)
+    if(d.ats_score >= 81) scoreColor = '#22c55e'; // Bright Green (Excellent)
+    else if(d.ats_score >= 61) scoreColor = '#84cc16'; // Green (Good)
+    else if(d.ats_score >= 31) scoreColor = '#eab308'; // Yellow (Fair)
+
     document.getElementById('analysis').innerHTML = `
+      <div style="margin-bottom:14px;padding:14px;background:rgba(255,255,255,0.05);border-radius:8px;border:2px solid ${scoreColor}">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <div style="font-size:48px;font-weight:bold;color:${scoreColor}">${d.ats_score}</div>
+          <div>
+            <div style="font-size:1.1rem;font-weight:bold;color:${scoreColor}">ATS Score: ${d.ats_category}</div>
+            <div class="muted">${d.is_strong_match ? '✓ Strong Match (70+)' : '○ Below threshold (70+)'}</div>
+          </div>
+        </div>
+      </div>
+
       <div class="row" style="margin-bottom:8px">
         <span class="pill">Top role fit: <b>${d.top_role}</b></span>
-        <span class="pill ${d.remote_friendly ? 'ok':'warn'}">Remote: ${d.remote_friendly ? 'Yes':'Unknown'}</span>
-        <span class="pill ${d.visa_sponsorship ? 'ok':'warn'}">Visa: ${d.visa_sponsorship ? 'Mentioned':'Not explicit'}</span>
-        <span class="pill ${d.relocation_support ? 'ok':'warn'}">Relocation: ${d.relocation_support ? 'Mentioned':'Not explicit'}</span>
+        <span class="pill ${d.remote_status === 'Yes' ? 'ok':'warn'}">Remote: ${d.remote_status}</span>
+        <span class="pill ${d.visa_sponsorship_status === 'Yes' ? 'ok':'warn'}">Visa: ${d.visa_sponsorship_status}</span>
+        <span class="pill ${d.relocation_support === 'Yes' ? 'ok':'warn'}">Relocation: ${d.relocation_support}</span>
       </div>
       <h3>Important ATS Keywords</h3><div>${pills(d.keywords.slice(0,28))}</div>
       <h3>Matched Skills</h3><div>${pills(d.tailoring.matched_skills)}</div>
@@ -605,9 +672,9 @@ async function saveFromAnalysis(){
     location: '',
     job_url: latestAnalysis.source_url || document.getElementById('job_url').value,
     status: 'Saved',
-    remote: latestAnalysis.remote_friendly,
-    visa_sponsorship: latestAnalysis.visa_sponsorship,
-    notes,
+    remote: latestAnalysis.remote_status === 'Yes',
+    visa_sponsorship: latestAnalysis.visa_sponsorship_status === 'Yes',
+    notes: notes ? `[ATS: ${latestAnalysis.ats_score}/100 - ${latestAnalysis.ats_category}] ${notes}` : `ATS: ${latestAnalysis.ats_score}/100 - ${latestAnalysis.ats_category}`,
     target_role: document.getElementById('target_role').value,
     top_keywords: latestAnalysis.keywords?.slice(0,15) || [],
     matched_skills: latestAnalysis.tailoring?.matched_skills || [],
