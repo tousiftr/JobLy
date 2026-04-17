@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -55,6 +56,12 @@ TITLES = [
     "bi engineer", "product analyst", "growth analyst", "marketing analyst", "web analyst",
     "digital analytics engineer", "senior data analyst", "senior analytics engineer",
 ]
+
+SCRAPE_ROLE_TERMS = {
+    "analytics engineer", "data analyst", "business intelligence analyst", "bi analyst",
+    "bi engineer", "product analyst", "growth analyst", "marketing analyst", "web analyst",
+    "data engineer", "analytics", "reporting analyst",
+}
 
 
 def now_iso() -> str:
@@ -182,6 +189,81 @@ def tailor_resume(job_text: str, role: str, user_skills: list[str]) -> dict[str,
 def bool_from_text(text: str, words: list[str]) -> bool:
     lower = text.lower()
     return any(w in lower for w in words)
+
+
+def matches_target_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(term in t for term in SCRAPE_ROLE_TERMS)
+
+
+def source_from_url(url: str) -> str:
+    try:
+        host = urlparse(url).netloc
+        return host.replace("www.", "") if host else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def fetch_remotive_jobs(limit: int = 120) -> list[dict[str, Any]]:
+    resp = requests.get("https://remotive.com/api/remote-jobs", timeout=20, headers={"User-Agent": "JobLy/1.0"})
+    resp.raise_for_status()
+    data = resp.json().get("jobs", [])
+    jobs: list[dict[str, Any]] = []
+    for row in data:
+        title = normalize_text(row.get("title", ""))
+        if not matches_target_title(title):
+            continue
+        description = normalize_text(BeautifulSoup(row.get("description", ""), "lxml").get_text(" ", strip=True))
+        company = normalize_text(row.get("company_name", ""))
+        location = normalize_text(row.get("candidate_required_location", "Remote"))
+        url = row.get("url") or row.get("job_url") or ""
+        combined_text = f"{title} {description}"
+        jobs.append({
+            "title": title,
+            "company": company,
+            "location": location,
+            "job_url": url,
+            "source": source_from_url(url) if url else "remotive.com",
+            "remote": bool_from_text(f"{location} {combined_text}", ["remote", "work from anywhere", "worldwide", "global"]),
+            "visa_sponsorship": bool_from_text(combined_text, ["visa sponsorship", "work permit", "sponsor"]),
+            "relocation_support": bool_from_text(combined_text, ["relocation", "relocation support", "relocation assistance"]),
+            "published_at": row.get("publication_date", ""),
+            "tags": row.get("tags", []),
+        })
+        if len(jobs) >= limit:
+            break
+    return jobs
+
+
+def fetch_arbeitnow_jobs(limit: int = 120) -> list[dict[str, Any]]:
+    resp = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=20, headers={"User-Agent": "JobLy/1.0"})
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    jobs: list[dict[str, Any]] = []
+    for row in data:
+        title = normalize_text(row.get("title", ""))
+        if not matches_target_title(title):
+            continue
+        description = normalize_text(BeautifulSoup(row.get("description", ""), "lxml").get_text(" ", strip=True))
+        company = normalize_text(row.get("company_name", ""))
+        location = normalize_text(row.get("location", ""))
+        url = row.get("url", "")
+        combined_text = f"{title} {description}"
+        jobs.append({
+            "title": title,
+            "company": company,
+            "location": location or "Not specified",
+            "job_url": url,
+            "source": source_from_url(url) if url else "arbeitnow.com",
+            "remote": bool_from_text(f"{location} {combined_text}", ["remote", "work from anywhere", "worldwide", "global"]),
+            "visa_sponsorship": bool_from_text(combined_text, ["visa sponsorship", "work permit", "sponsor"]),
+            "relocation_support": bool_from_text(combined_text, ["relocation", "relocation support", "relocation assistance"]),
+            "published_at": row.get("created_at", ""),
+            "tags": row.get("tags", []),
+        })
+        if len(jobs) >= limit:
+            break
+    return jobs
 
 
 @app.get("/")
@@ -340,6 +422,31 @@ def search_queries() -> Any:
     return jsonify({"queries": queries})
 
 
+@app.get("/api/web-jobs")
+def web_jobs() -> Any:
+    combined: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for fetcher in (fetch_remotive_jobs, fetch_arbeitnow_jobs):
+        try:
+            combined.extend(fetcher())
+        except Exception as exc:
+            warnings.append(f"{fetcher.__name__} failed: {exc}")
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for job in combined:
+        key = normalize_text(job.get("job_url", "")).lower() or (
+            f"{normalize_text(job.get('title', '')).lower()}|"
+            f"{normalize_text(job.get('company', '')).lower()}|"
+            f"{normalize_text(job.get('location', '')).lower()}"
+        )
+        if key not in deduped:
+            deduped[key] = job
+
+    jobs = list(deduped.values())
+    jobs.sort(key=lambda j: j.get("published_at") or "", reverse=True)
+    return jsonify({"jobs": jobs, "count": len(jobs), "warnings": warnings, "scanned_at": now_iso()})
+
+
 HTML = """
 <!doctype html>
 <html lang="en">
@@ -430,6 +537,18 @@ HTML = """
       <p class="muted">Use these on Google and set <b>Tools → Past week</b>; then verify each posting page for real recency and sponsorship wording.</p>
       <div class="row"><button class="secondary" onclick="loadQueries()">Generate Queries</button></div>
       <div id="queries" class="list" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card" style="margin-top:14px">
+      <h2>5) Live Web Scraped Jobs</h2>
+      <p class="muted">Fetches current analytics/data jobs from public job-board APIs using the same title/visa/remote matching logic.</p>
+      <div class="row">
+        <button class="secondary" onclick="loadWebJobs()">Load All Jobs</button>
+      </div>
+      <p id="web_jobs_meta" class="muted" style="margin:.7rem 0 .4rem"></p>
+      <div style="overflow:auto"><table id="web_jobs_tbl"><thead><tr>
+        <th>Role / Company</th><th>Location</th><th>Remote</th><th>Visa</th><th>Source</th><th>Published</th>
+      </tr></thead><tbody><tr><td colspan="6" class="muted">Click "Load All Jobs" to fetch listings.</td></tr></tbody></table></div>
     </section>
   </div>
 
@@ -546,6 +665,33 @@ async function loadQueries(){
   const d = await jfetch('/api/search-queries');
   const q = document.getElementById('queries');
   q.innerHTML = d.queries.map(x=>`<div style="padding:6px 4px;border-bottom:1px solid #26345a"><code>${x}</code></div>`).join('');
+}
+
+async function loadWebJobs(){
+  const meta = document.getElementById('web_jobs_meta');
+  const body = document.querySelector('#web_jobs_tbl tbody');
+  meta.textContent = 'Loading jobs from web sources...';
+  body.innerHTML = '<tr><td colspan="6" class="muted">Loading...</td></tr>';
+  try{
+    const d = await jfetch('/api/web-jobs');
+    meta.textContent = `Found ${d.count} jobs · scanned at ${new Date(d.scanned_at).toLocaleString()}`;
+    if((d.warnings||[]).length){
+      meta.textContent += ` · warnings: ${d.warnings.join(' | ')}`;
+    }
+    body.innerHTML = (d.jobs||[]).map(j=>{
+      return `<tr>
+        <td><b>${j.title}</b><div class="muted">${j.company || ''} ${j.job_url ? `· <a href="${j.job_url}" target="_blank">link</a>`:''}</div></td>
+        <td>${j.location || ''}</td>
+        <td>${j.remote ? 'Yes':'No'}</td>
+        <td>${j.visa_sponsorship ? 'Mentioned':'No'}</td>
+        <td>${j.source || ''}</td>
+        <td>${j.published_at || ''}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="6" class="muted">No matching jobs found right now.</td></tr>';
+  }catch(e){
+    meta.textContent = `Failed to load web jobs: ${e.message}`;
+    body.innerHTML = '<tr><td colspan="6" class="warn">Could not fetch web jobs right now.</td></tr>';
+  }
 }
 
 loadStats();
