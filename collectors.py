@@ -164,13 +164,14 @@ class ArbeitnowCollector(JobCollector):
 
 
 class GreenhouseCollector(JobCollector):
-    """Fetch jobs from Greenhouse boards"""
+    """Fetch jobs from Greenhouse boards via the official boards-api host."""
 
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
         for company in GREENHOUSE_COMPANIES[:50]:  # Use config list
             try:
-                url = f"https://boards.greenhouse.io/api/v1/boards/{company}/jobs"
+                # Correct endpoint: boards-api.greenhouse.io (not boards.greenhouse.io/api)
+                url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true"
                 resp = safe_get(url, self.session)
                 if resp is None:
                     continue
@@ -222,38 +223,43 @@ class GreenhouseCollector(JobCollector):
 
 
 class LeverCollector(JobCollector):
-    """Fetch jobs from Lever boards"""
+    """Fetch jobs from Lever boards.
+
+    The Lever public API returns a JSON array at the root — NOT a dict with a
+    `postings` key. Fields per posting: text, hostedUrl, applyUrl, categories
+    (team/location/commitment), createdAt, description, descriptionPlain.
+    """
 
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
-        for company in LEVER_COMPANIES[:50]:  # Use config list
+        for company in LEVER_COMPANIES[:50]:
             try:
-                # Fixed API endpoint: correct is /v0/postings/{slug}?mode=json not /v0/postings/companies/{slug}
                 url = f"https://api.lever.co/v0/postings/{company}?mode=json"
                 resp = safe_get(url, self.session)
                 if resp is None:
                     continue
 
-                for job in resp.json().get("postings", []):
-                    if not self._is_matching_title(job.get("text", "")):
+                data = resp.json()
+                postings = data if isinstance(data, list) else data.get("postings", [])
+
+                for job in postings:
+                    title = job.get("text", "")
+                    if not self._is_matching_title(title):
                         continue
 
-                    description = job.get("descriptionPlain", "")
-                    locations = job.get("locations", [])
-                    location = (
-                        ", ".join([l.get("name", "") for l in locations])
-                        or "Not specified"
-                    )
+                    description = job.get("descriptionPlain") or strip_html(job.get("description", ""))
+                    categories = job.get("categories", {}) or {}
+                    location = categories.get("location") or "Not specified"
 
                     all_jobs.append({
-                        "title": job.get("text", ""),
-                        "company": job.get("owner", {}).get("name", company),
+                        "title": title,
+                        "company": company.replace("-", " ").title(),
                         "location": location,
-                        "job_url": job.get("urls", {}).get("show", ""),
+                        "job_url": job.get("hostedUrl") or job.get("applyUrl", ""),
                         "source": "lever",
                         "description": description,
                         "published_at": job.get("createdAt", ""),
-                        "remote": "remote" in location.lower(),
+                        "remote": "remote" in str(location).lower(),
                         "visa_sponsorship": has_visa(description),
                         "relocation_support": has_relocation(description),
                     })
@@ -278,41 +284,77 @@ class LeverCollector(JobCollector):
 
 
 class AshbyCollector(JobCollector):
-    """Fetch jobs from Ashby boards"""
+    """Fetch jobs from Ashby boards via GraphQL.
+
+    The REST `posting-api` endpoint is flaky / locked behind a feature flag; the
+    board frontend hits a GraphQL endpoint at `jobs.ashbyhq.com/api/non-user-graphql`
+    which works for any public-facing Ashby board.
+    """
+
+    GRAPHQL_URL = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
+    GRAPHQL_QUERY = """
+        query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
+          jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) {
+            jobPostings {
+              id
+              title
+              locationName
+              employmentType
+              secondaryLocations { locationName }
+            }
+          }
+        }
+    """
 
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
-        for company in ASHBY_COMPANIES[:50]:  # Use config list, skip dummy "company" value
+        for company in ASHBY_COMPANIES[:50]:
             if company.lower() == "company":
                 continue
             try:
-                # Fixed endpoint: correct is /posting-api/job-board/{slug} not posting.listByCompanyName
-                url = f"https://api.ashbyhq.com/posting-api/job-board/{company}"
-                resp = safe_get(url, self.session, params={"includeCompanyName": True})
-                if resp is None:
+                payload = {
+                    "operationName": "ApiJobBoardWithTeams",
+                    "variables": {"organizationHostedJobsPageName": company},
+                    "query": self.GRAPHQL_QUERY,
+                }
+                resp = self.session.post(
+                    self.GRAPHQL_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self.timeout,
+                )
+                if resp.status_code != 200:
                     continue
 
-                for job in resp.json().get("results", []) or resp.json().get("postings", []):
+                data = resp.json()
+                board = (data.get("data") or {}).get("jobBoard") or {}
+                postings = board.get("jobPostings") or []
+
+                for job in postings:
                     title = job.get("title", "")
                     if not self._is_matching_title(title):
                         continue
 
-                    description = job.get("descriptionHtml", "") or job.get("description", "")
-                    description = strip_html(description) if isinstance(description, str) else ""
-                    location_objs = job.get("locations", [])
-                    location = (
-                        ", ".join([l.get("name", "") for l in location_objs])
-                        or "Not specified"
-                    )
+                    job_id = job.get("id", "")
+                    primary_loc = job.get("locationName") or ""
+                    secondary = job.get("secondaryLocations") or []
+                    extra_locs = [l.get("locationName", "") for l in secondary if l.get("locationName")]
+                    location = ", ".join([primary_loc] + extra_locs) if primary_loc else "Not specified"
+
+                    # Public job URL convention
+                    job_url = f"https://jobs.ashbyhq.com/{company}/{job_id}" if job_id else ""
+
+                    # GraphQL payload doesn't include description; title-only scoring
+                    description = title
 
                     all_jobs.append({
                         "title": title,
-                        "company": job.get("companyName", company),
+                        "company": company.replace("-", " ").title(),
                         "location": location,
-                        "job_url": job.get("url", ""),
+                        "job_url": job_url,
                         "source": "ashby",
                         "description": description,
-                        "published_at": job.get("createdAt", ""),
+                        "published_at": "",
                         "remote": "remote" in location.lower(),
                         "visa_sponsorship": has_visa(description),
                         "relocation_support": has_relocation(description),
