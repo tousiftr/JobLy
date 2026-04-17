@@ -151,10 +151,11 @@ CORE_PHRASES = {
 
 
 def tokens(text: str) -> list[str]:
-    return [t.lower() for t in re.findall(r"[a-zA-Z][a-zA-Z0-9+#\.]{1,}", text)]
+    return [t.lower() for t in re.findall(r"[a-zA-Z][a-zA-Z0-9+#\.]{1,}", str(text or ""))]
 
 
 def extract_keywords(text: str, top_n: int = 30) -> list[str]:
+    text = str(text or "")
     tk = [t for t in tokens(text) if t not in STOPWORDS and len(t) > 2]
     counts = Counter(tk)
 
@@ -200,8 +201,8 @@ def calculate_ats_match_score(
     if user_skills is None:
         user_skills = []
 
-    lower = job_text.lower()
-    title_lower = (job_title or "").lower()
+    lower = str(job_text or "").lower()
+    title_lower = str(job_title or "").lower()
     role_skills = ROLE_SKILL_MAP.get(target_role, [])
 
     # 1. Title match — strongest signal (up to 40 pts)

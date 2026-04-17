@@ -251,6 +251,13 @@ class LeverCollector(JobCollector):
                     categories = job.get("categories", {}) or {}
                     location = categories.get("location") or "Not specified"
 
+                    # Lever returns createdAt as unix milliseconds (int) — normalize to ISO string
+                    created = job.get("createdAt")
+                    if isinstance(created, (int, float)) and created > 0:
+                        published_at = datetime.fromtimestamp(created / 1000, tz=timezone.utc).isoformat()
+                    else:
+                        published_at = str(created or "")
+
                     all_jobs.append({
                         "title": title,
                         "company": company.replace("-", " ").title(),
@@ -258,7 +265,7 @@ class LeverCollector(JobCollector):
                         "job_url": job.get("hostedUrl") or job.get("applyUrl", ""),
                         "source": "lever",
                         "description": description,
-                        "published_at": job.get("createdAt", ""),
+                        "published_at": published_at,
                         "remote": "remote" in str(location).lower(),
                         "visa_sponsorship": has_visa(description),
                         "relocation_support": has_relocation(description),

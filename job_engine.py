@@ -67,11 +67,11 @@ class JobEngine:
         # Deduplicate by (title, company, location)
         unique_jobs = self._dedup(all_jobs)
 
-        # Sort by published date (newest first)
+        # Sort by published date (newest first) — coerce to str to avoid mixed int/str comparison
         sorted_jobs = sorted(
             unique_jobs,
-            key=lambda j: j.get("published_at", ""),
-            reverse=True
+            key=lambda j: str(j.get("published_at") or ""),
+            reverse=True,
         )
 
         # Calculate ATS scores for each job (against all 3 roles, pick best)
