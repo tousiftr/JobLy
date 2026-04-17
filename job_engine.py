@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from collectors import ALL_COLLECTORS
+from utils import calculate_ats_match_score, extract_keywords, infer_role_scores
 
 
 class JobEngine:
@@ -72,6 +73,38 @@ class JobEngine:
             key=lambda j: j.get("published_at", ""),
             reverse=True
         )
+
+        # Calculate ATS scores for each job (against all 3 roles, pick best)
+        for job in sorted_jobs:
+            description = job.get("description", "")
+            if description:
+                try:
+                    scores = {}
+                    for role in ["Data Analyst", "Analytics Engineer", "Data Engineer"]:
+                        score, category, is_strong = calculate_ats_match_score(description, role, [])
+                        scores[role] = (score, category, is_strong)
+
+                    best_role = max(scores, key=lambda r: scores[r][0])
+                    best_score, best_category, best_strong = scores[best_role]
+
+                    job["ats_score"] = best_score
+                    job["ats_category"] = best_category
+                    job["role_match"] = best_role
+                    job["matched_skills"] = extract_keywords(description, top_n=15)
+                    job["top_keywords"] = extract_keywords(description, top_n=30)
+                except Exception as e:
+                    job["ats_score"] = None
+                    job["ats_category"] = None
+                    job["role_match"] = ""
+                    job["matched_skills"] = []
+                    job["top_keywords"] = []
+                    print(f"  ATS scoring failed for {job.get('title')}: {e}")
+            else:
+                job["ats_score"] = None
+                job["ats_category"] = None
+                job["role_match"] = ""
+                job["matched_skills"] = []
+                job["top_keywords"] = []
 
         print(f"Scan complete: {len(sorted_jobs)} unique jobs from {len(all_jobs)} total")
         return sorted_jobs

@@ -1,7 +1,7 @@
 import json
 import re
 import sqlite3
-from collections import Counter
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,18 +13,13 @@ from flask import Flask, Response, jsonify, request
 
 from scheduler import start_scheduler, stop_scheduler
 from job_engine import engine
+from utils import calculate_ats_match_score, extract_keywords, infer_role_scores
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "jobly.db"
 
 app = Flask(__name__)
 
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
-    "in", "is", "it", "its", "of", "on", "or", "that", "the", "to", "with", "you",
-    "your", "our", "we", "will", "this", "they", "their", "who", "what", "when", "where",
-    "how", "about", "into", "more", "least", "plus", "role", "team", "experience", "work",
-}
 
 ROLE_SKILL_MAP = {
     "Data Analyst": [
@@ -90,16 +85,42 @@ def init_db() -> None:
                 status TEXT DEFAULT 'Saved',
                 remote INTEGER DEFAULT 0,
                 visa_sponsorship INTEGER DEFAULT 0,
+                relocation_support INTEGER DEFAULT 0,
                 notes TEXT,
                 target_role TEXT,
                 top_keywords TEXT,
                 matched_skills TEXT,
                 missing_skills TEXT,
+                ats_score REAL,
+                applied_date TEXT,
+                source TEXT,
+                raw_job_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        # Add new columns if they don't exist
+        try:
+            conn.execute("ALTER TABLE tracked_jobs ADD COLUMN relocation_support INTEGER DEFAULT 0")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE tracked_jobs ADD COLUMN ats_score REAL")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE tracked_jobs ADD COLUMN applied_date TEXT")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE tracked_jobs ADD COLUMN source TEXT")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE tracked_jobs ADD COLUMN raw_job_id TEXT")
+        except:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS raw_jobs (
@@ -165,82 +186,6 @@ def fetch_job_text(url: str) -> str:
     return normalize_text(text)
 
 
-def tokens(text: str) -> list[str]:
-    return [t.lower() for t in re.findall(r"[a-zA-Z][a-zA-Z0-9+#\.]{1,}", text)]
-
-
-def extract_keywords(text: str, top_n: int = 30) -> list[str]:
-    tk = [t for t in tokens(text) if t not in STOPWORDS and len(t) > 2]
-    counts = Counter(tk)
-
-    phrase_hits = []
-    lower = text.lower()
-    for phrase in CORE_PHRASES:
-        if phrase in lower:
-            phrase_hits.append((phrase, lower.count(phrase) + 2))
-
-    for phrase, score in phrase_hits:
-        counts[phrase] += score
-
-    return [w for w, _ in counts.most_common(top_n)]
-
-
-def infer_role_scores(text: str) -> dict[str, int]:
-    lower = text.lower()
-    scores: dict[str, int] = {}
-    for role, skills in ROLE_SKILL_MAP.items():
-        score = 0
-        for skill in skills:
-            if skill in lower:
-                score += 2
-        if role.lower() in lower:
-            score += 4
-        scores[role] = score
-    return scores
-
-
-def calculate_ats_match_score(job_text: str, target_role: str, user_skills: list[str]) -> tuple[int, str, bool]:
-    """
-    Calculate ATS match score (0-100) based on job-to-profile fit.
-
-    Returns:
-        (score: int, category: str, is_strong_match: bool)
-        category: "Poor", "Fair", "Good", "Excellent"
-        is_strong_match: True if score >= 70
-    """
-    lower = job_text.lower()
-    role_skills = ROLE_SKILL_MAP.get(target_role, [])
-
-    # Count matched skills (each worth 15 points)
-    matched_count = sum(1 for skill in role_skills if skill in lower)
-    matched_score = matched_count * 15
-
-    # Role fit bonus (from infer_role_scores)
-    role_scores = infer_role_scores(job_text)
-    role_fit = role_scores.get(target_role, 0)
-    role_bonus = min(role_fit * 3, 25)  # Cap at 25 points
-
-    # Keyword rarity boost - count extracted keywords that are in CORE_PHRASES
-    keywords = extract_keywords(job_text, top_n=30)
-    rare_keyword_count = sum(1 for kw in keywords if kw in CORE_PHRASES)
-    keyword_boost = min(rare_keyword_count * 5, 20)  # Cap at 20 points
-
-    # Calculate raw score, cap at 100
-    raw_score = min(matched_score + role_bonus + keyword_boost, 100)
-
-    # Categorize
-    if raw_score >= 81:
-        category = "Excellent"
-    elif raw_score >= 61:
-        category = "Good"
-    elif raw_score >= 31:
-        category = "Fair"
-    else:
-        category = "Poor"
-
-    is_strong_match = raw_score >= 70
-
-    return raw_score, category, is_strong_match
 
 
 def tailor_resume(job_text: str, role: str, user_skills: list[str]) -> dict[str, Any]:
@@ -683,93 +628,215 @@ def move_raw_to_tracker(job_id: str) -> Any:
     return jsonify({"message": "Moved to tracker", "tracked_id": cur.lastrowid})
 
 
+# Scheduler and tracking variables
+scheduler = None
+last_scrape_time = None
+last_scrape_count = 0
+
+
+@app.get("/api/scraper/status")
+def scraper_status() -> Any:
+    """Get current scraper status and schedule info"""
+    global last_scrape_time, last_scrape_count
+
+    if scheduler and scheduler.running:
+        jobs = scheduler.get_jobs()
+        next_run = None
+        if jobs:
+            next_run = jobs[0].next_run_time.isoformat() if jobs[0].next_run_time else None
+
+        return jsonify({
+            "scheduler_running": True,
+            "last_scrape_time": last_scrape_time,
+            "last_scrape_count": last_scrape_count,
+            "next_scheduled_run": next_run,
+            "schedule": "Daily at 18:00 UTC (6 PM)",
+        })
+    else:
+        return jsonify({"scheduler_running": False, "error": "Scheduler not running"})
+
+
+@app.post("/api/scraper/run-now")
+def trigger_scraper() -> Any:
+    """Manually trigger a job scraping run"""
+    global last_scrape_time, last_scrape_count
+
+    try:
+        print("\nManual scraper trigger...")
+        jobs = engine.scan()
+        print(f"Collected {len(jobs)} jobs")
+
+        # Store in database
+        now = now_iso()
+        stored_count = 0
+        with get_conn() as conn:
+            for job in jobs:
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO raw_jobs (
+                            job_id, title, company, location, job_url, source,
+                            description, remote, visa_sponsorship, relocation_support,
+                            ats_score, ats_category, role_match, matched_skills,
+                            top_keywords, published_at, scraped_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job.get("job_id", ""),
+                            job.get("title", ""),
+                            job.get("company", ""),
+                            job.get("location", ""),
+                            job.get("job_url", ""),
+                            job.get("source", ""),
+                            job.get("description", ""),
+                            1 if job.get("remote") else 0,
+                            1 if job.get("visa_sponsorship") else 0,
+                            1 if job.get("relocation_support") else 0,
+                            job.get("ats_score"),
+                            job.get("ats_category"),
+                            job.get("role_match", ""),
+                            json.dumps(job.get("matched_skills", [])),
+                            json.dumps(job.get("top_keywords", [])),
+                            job.get("published_at", ""),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    stored_count += 1
+                except Exception as e:
+                    print(f"Error storing job: {e}")
+                    continue
+
+        last_scrape_time = now
+        last_scrape_count = stored_count
+
+        progress = engine.get_progress()
+        return jsonify({
+            "success": True,
+            "jobs_collected": len(jobs),
+            "jobs_stored": stored_count,
+            "timestamp": now,
+            "sources": progress,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 HTML = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>JobLy — Personal Job Search & ATS Assistant</title>
+  <title>JobLy — AI-Powered Job Search & ATS Optimizer</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #ffffff; color: #1a1a1a; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #f5f5f5; color: #1a1a1a; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+
+    .navbar { background: white; border-bottom: 1px solid #e0e0e0; position: sticky; top: 0; z-index: 100; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .navbar-inner { max-width: 1400px; margin: 0 auto; padding: 0; display: flex; align-items: center; }
+    .navbar-brand { font-size: 20px; font-weight: 700; color: #0066cc; padding: 16px 24px; }
+    .navbar-tabs { display: flex; flex: 1; border-left: 1px solid #e0e0e0; }
+    .navbar-tab { padding: 16px 20px; border: none; background: none; cursor: pointer; font-size: 14px; font-weight: 500; color: #666; border-bottom: 3px solid transparent; transition: all 0.2s; }
+    .navbar-tab:hover { background: #f5f5f5; }
+    .navbar-tab.active { color: #0066cc; border-bottom-color: #0066cc; }
+
     .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-    header { border-bottom: 1px solid #e5e5e5; padding: 24px 0; margin-bottom: 32px; }
-    h1 { font-size: 32px; font-weight: 600; color: #1a1a1a; margin-bottom: 8px; }
-    .tagline { font-size: 15px; color: #666; }
-    h2 { font-size: 20px; font-weight: 600; color: #1a1a1a; margin: 24px 0 16px 0; }
-    h3 { font-size: 14px; font-weight: 600; color: #1a1a1a; margin: 16px 0 12px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+    header { padding: 0; margin-bottom: 24px; }
+    h1 { font-size: 28px; font-weight: 600; color: #1a1a1a; margin-bottom: 4px; }
+    .tagline { font-size: 14px; color: #666; }
+    h2 { font-size: 18px; font-weight: 600; color: #1a1a1a; margin: 24px 0 16px 0; }
+    h3 { font-size: 13px; font-weight: 600; color: #666; margin: 16px 0 12px 0; text-transform: uppercase; letter-spacing: 0.5px; }
 
-    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; margin-bottom: 32px; }
-    @media(max-width: 1024px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: white; border: 1px solid #e0e0e0; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
 
-    .card { background: #f9f9f9; border: 1px solid #e5e5e5; border-radius: 8px; padding: 24px; }
-    .card.white { background: #ffffff; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
 
-    label { display: block; font-size: 13px; font-weight: 500; color: #666; margin: 16px 0 6px 0; text-transform: uppercase; letter-spacing: 0.5px; }
-    input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #e5e5e5; border-radius: 6px; font-size: 14px; font-family: inherit; margin-bottom: 12px; }
-    input:focus, textarea:focus, select:focus { outline: none; border-color: #0066cc; box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.1); }
+    label { display: block; font-size: 12px; font-weight: 600; color: #666; margin: 16px 0 6px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+    input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; font-family: inherit; margin-bottom: 12px; }
+    input:focus, textarea:focus, select:focus { outline: none; border-color: #0066cc; box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1); }
     textarea { min-height: 120px; resize: vertical; }
 
-    button { background: #0066cc; color: white; border: none; border-radius: 6px; padding: 10px 16px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background 0.2s; }
-    button:hover { background: #0052a3; }
-    button.secondary { background: transparent; color: #0066cc; border: 1px solid #0066cc; }
-    button.secondary:hover { background: rgba(0, 102, 204, 0.05); }
+    button { background: #0066cc; color: white; border: none; border-radius: 6px; padding: 10px 16px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+    button:hover { background: #0052a3; transform: translateY(-1px); box-shadow: 0 2px 4px rgba(0,102,204,0.2); }
+    button.secondary { background: white; color: #0066cc; border: 1px solid #0066cc; }
+    button.secondary:hover { background: #f0f8ff; }
     button.small { padding: 6px 12px; font-size: 13px; }
 
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; margin-bottom: 12px; }
     .row > div { flex: 1; min-width: 200px; }
 
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
-    .stat { background: white; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px; text-align: center; }
-    .stat-label { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-    .stat-value { font-size: 24px; font-weight: 600; color: #0066cc; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .stat { background: white; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; text-align: center; }
+    .stat-label { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #0066cc; }
 
-    .filters { background: white; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
-    .filter-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .filters { background: #f9f9f9; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    .filter-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: flex-end; }
     .checkbox-group { display: flex; gap: 16px; align-items: center; }
     .checkbox { display: flex; align-items: center; gap: 6px; }
     input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
 
-    .tag { display: inline-block; background: #e5f0ff; color: #0066cc; padding: 4px 12px; border-radius: 20px; font-size: 13px; margin: 2px 4px 2px 0; }
-    .tag.strong { background: #0066cc; color: white; }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; margin: 2px 4px 2px 0; }
+    .badge.remote { background: #d4f1d4; color: #2e7d32; }
+    .badge.visa { background: #bbdefb; color: #1565c0; }
+    .badge.relocation { background: #ffe0b2; color: #e65100; }
+    .badge.status { background: #e5e5e5; color: #333; }
 
     table { width: 100%; border-collapse: collapse; }
-    th { background: #f0f0f0; text-align: left; padding: 12px; font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e5e5e5; }
+    th { background: #f5f5f5; text-align: left; padding: 12px; font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e0e0e0; cursor: pointer; }
+    th:hover { background: #efefef; }
     td { padding: 12px; border-bottom: 1px solid #f0f0f0; }
     tr:hover { background: #fafafa; }
 
-    .job-title { font-weight: 600; color: #0066cc; }
-    .job-subtitle { font-size: 13px; color: #999; margin-top: 4px; }
+    .job-title { font-weight: 600; color: #0066cc; cursor: pointer; }
+    .job-subtitle { font-size: 12px; color: #999; margin-top: 3px; }
 
-    .ats-score { display: inline-block; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
-    .ats-score.poor { background: #ffe5e5; color: #d32f2f; }
-    .ats-score.fair { background: #fff3e0; color: #f57f17; }
-    .ats-score.good { background: #e8f5e9; color: #388e3c; }
-    .ats-score.excellent { background: #d4edda; color: #155724; }
+    .ats-score { display: inline-block; font-weight: 600; padding: 3px 10px; border-radius: 4px; font-size: 13px; }
+    .ats-score.poor { background: #ffcdd2; color: #c62828; }
+    .ats-score.fair { background: #ffe0b2; color: #e65100; }
+    .ats-score.good { background: #c8e6c9; color: #2e7d32; }
+    .ats-score.excellent { background: #a5d6a7; color: #1b5e20; }
 
-    .list { max-height: 300px; overflow-y: auto; border: 1px solid #e5e5e5; border-radius: 6px; }
-    .list-item { padding: 12px; border-bottom: 1px solid #f0f0f0; font-size: 13px; font-family: "Monaco", monospace; }
+    .list { max-height: 300px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 6px; background: white; }
+    .list-item { padding: 12px; border-bottom: 1px solid #f0f0f0; font-size: 13px; font-family: monospace; }
     .list-item:last-child { border-bottom: none; }
 
-    .no-data { text-align: center; color: #999; padding: 32px; }
-    .error { color: #d32f2f; padding: 12px; background: #ffebee; border-radius: 6px; }
-    .success { color: #155724; padding: 12px; background: #d4edda; border-radius: 6px; }
+    .no-data { text-align: center; color: #999; padding: 40px 20px; }
+    .error { color: #b71c1c; padding: 12px; background: #ffcdd2; border-radius: 6px; margin-bottom: 12px; }
+    .success { color: #1b5e20; padding: 12px; background: #c8e6c9; border-radius: 6px; margin-bottom: 12px; }
+    .info { color: #0d47a1; padding: 12px; background: #bbdefb; border-radius: 6px; margin-bottom: 12px; }
+
+    .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 16px 24px; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); z-index: 1000; animation: slideIn 0.3s; }
+    @keyframes slideIn { from { transform: translateY(100px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
     a { color: #0066cc; text-decoration: none; }
     a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
-  <header>
-    <div class="container">
-      <h1>JobLy</h1>
-      <p class="tagline">Smart job search & ATS-optimized resume assistant for Data Analysts, Analytics Engineers, and Data Engineers</p>
+  <nav class="navbar">
+    <div class="navbar-inner">
+      <div class="navbar-brand">JobLy</div>
+      <div class="navbar-tabs">
+        <button class="navbar-tab active" onclick="switchTab('analyzer')">📋 Analyzer</button>
+        <button class="navbar-tab" onclick="switchTab('discover')">🔍 Discover</button>
+        <button class="navbar-tab" onclick="switchTab('tracker')">📌 Tracker</button>
+        <button class="navbar-tab" onclick="switchTab('queries')">🔎 Search</button>
+      </div>
     </div>
-  </header>
+  </nav>
 
   <div class="container">
-    <!-- Job Analyzer Section -->
+    <header>
+      <h1>JobLy</h1>
+      <p class="tagline">AI-powered job search & ATS resume optimizer for Data professionals seeking remote & visa-sponsored roles</p>
+    </header>
+    <!-- ANALYZER TAB -->
+    <div id="analyzer" class="tab-content active">
+      <h2>Job Analysis & Resume Tailoring</h2>
     <div class="grid">
       <section class="card">
         <h2>Analyze Job Posting</h2>
@@ -813,9 +880,11 @@ HTML = """
         </div>
       </section>
     </div>
+    </div><!-- End analyzer tab -->
 
-    <!-- Tracked Jobs Section -->
-    <section class="card white">
+    <!-- TRACKER TAB -->
+    <div id="tracker" class="tab-content">
+    <section class="card">
       <h2>Your Tracked Jobs</h2>
       <div style="overflow-x: auto;">
         <table id="jobs_tbl">
@@ -826,9 +895,11 @@ HTML = """
         </table>
       </div>
     </section>
+    </div><!-- End tracker tab -->
 
-    <!-- Raw Jobs Section -->
-    <section class="card white">
+    <!-- DISCOVER TAB -->
+    <div id="discover" class="tab-content">
+    <section class="card">
       <h2>Smart Job Discovery</h2>
       <p style="color: #666; margin-bottom: 16px;">Browse automatically scraped jobs matching your criteria. Filter by remote status, visa sponsorship, and ATS score.</p>
 
@@ -863,14 +934,18 @@ HTML = """
         </table>
       </div>
     </section>
+    </div><!-- End discover tab -->
 
-    <!-- Search Queries Section -->
-    <section class="card white">
+    <!-- QUERIES TAB -->
+    <div id="queries" class="tab-content">
+    <section class="card">
       <h2>Google Search Queries</h2>
       <p style="color: #666; margin-bottom: 16px;">Pre-built search queries for major ATS boards. Use on Google with Tools → Past week filter.</p>
       <button class="secondary" onclick="loadQueries()" style="margin-bottom: 16px;">Generate Queries</button>
       <div class="list" id="queries"></div>
     </section>
+    </div><!-- End queries tab -->
+
   </div>
 
 <script>
@@ -954,7 +1029,7 @@ async function saveFromAnalysis(){
   })});
   await loadJobs();
   await loadStats();
-  alert('Saved to tracker');
+  showToast('✓ Job saved to tracker');
 }
 
 async function loadJobs(){
@@ -1040,11 +1115,12 @@ async function loadRawJobs(){
 async function moveToTracker(jobId){
   try{
     await jfetch(`/api/jobs/raw/${jobId}/track`, {method:'PATCH'});
-    alert('Job saved to tracker');
+    showToast('✓ Job saved to tracker');
+    await loadRawJobs();
     await loadJobs();
     await loadStats();
   }catch(e){
-    alert(`Error: ${e.message}`);
+    showToast(`✗ Error: ${e.message}`);
   }
 }
 
@@ -1065,6 +1141,33 @@ async function loadQueries(){
   }
 }
 
+function switchTab(tabName) {
+  // Hide all tabs
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.navbar-tab').forEach(el => el.classList.remove('active'));
+
+  // Show selected tab
+  const tab = document.getElementById(tabName);
+  if (tab) {
+    tab.classList.add('active');
+    // Mark button as active
+    event.target.classList.add('active');
+
+    // Load data when switching to discover/tracker tabs
+    if (tabName === 'discover') loadRawJobs();
+    if (tabName === 'tracker') { loadJobs(); loadStats(); }
+    if (tabName === 'queries') loadQueries();
+  }
+}
+
+function showToast(message, duration = 3000) {
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), duration);
+}
+
 loadStats();
 loadJobs();
 </script>
@@ -1075,4 +1178,13 @@ loadJobs();
 
 if __name__ == "__main__":
     init_db()
+
+    # Start scheduler for daily 6 PM scraping (UTC)
+    try:
+        scheduler = start_scheduler(str(DB_PATH), hour=18, minute=0)
+        print("Scheduler initialized for daily scraping at 18:00 UTC")
+    except Exception as e:
+        print(f"Warning: Could not start scheduler: {e}")
+        scheduler = None
+
     app.run(host="0.0.0.0", port=5000, debug=False)

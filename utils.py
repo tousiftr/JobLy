@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import re
 import time
 import logging
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -117,3 +118,101 @@ def role_matches(title: str, roles: list) -> bool:
 
 def humanise(slug: str) -> str:
     return slug.replace("-", " ").replace("_", " ").title()
+
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
+    "in", "is", "it", "its", "of", "on", "or", "that", "the", "to", "with", "you",
+    "your", "our", "we", "will", "this", "they", "their", "who", "what", "when", "where",
+    "how", "about", "into", "more", "least", "plus", "role", "team", "experience", "work",
+}
+
+ROLE_SKILL_MAP = {
+    "Data Analyst": [
+        "sql", "python", "tableau", "power bi", "dashboard", "a b testing", "statistics",
+        "excel", "stakeholder", "kpi", "data visualization", "ga4", "gtm",
+    ],
+    "Analytics Engineer": [
+        "dbt", "sql", "python", "snowflake", "bigquery", "redshift", "etl", "elt",
+        "dimensional modeling", "airflow", "git", "data modeling", "tests", "ci cd",
+    ],
+    "Data Engineer": [
+        "python", "spark", "sql", "airflow", "kafka", "aws", "gcp", "azure", "databricks",
+        "batch", "streaming", "orchestration", "data lake", "warehouse", "terraform",
+    ],
+}
+
+CORE_PHRASES = {
+    "visa sponsorship", "work permit", "relocation support", "remote", "global remote",
+    "analytics engineer", "data analyst", "data engineer", "business intelligence", "power bi",
+    "tableau", "dbt", "snowflake", "bigquery", "redshift", "airflow", "ga4", "gtm",
+    "stakeholder management", "data modeling", "machine learning", "a b testing",
+}
+
+
+def tokens(text: str) -> list[str]:
+    return [t.lower() for t in re.findall(r"[a-zA-Z][a-zA-Z0-9+#\.]{1,}", text)]
+
+
+def extract_keywords(text: str, top_n: int = 30) -> list[str]:
+    tk = [t for t in tokens(text) if t not in STOPWORDS and len(t) > 2]
+    counts = Counter(tk)
+
+    phrase_hits = []
+    lower = text.lower()
+    for phrase in CORE_PHRASES:
+        if phrase in lower:
+            phrase_hits.append((phrase, lower.count(phrase) + 2))
+
+    for phrase, score in phrase_hits:
+        counts[phrase] += score
+
+    return [w for w, _ in counts.most_common(top_n)]
+
+
+def infer_role_scores(text: str) -> dict[str, int]:
+    lower = text.lower()
+    scores: dict[str, int] = {}
+    for role, skills in ROLE_SKILL_MAP.items():
+        score = 0
+        for skill in skills:
+            if skill in lower:
+                score += 2
+        if role.lower() in lower:
+            score += 4
+        scores[role] = score
+    return scores
+
+
+def calculate_ats_match_score(job_text: str, target_role: str, user_skills: list[str] = None) -> tuple[int, str, bool]:
+    if user_skills is None:
+        user_skills = []
+
+    lower = job_text.lower()
+    role_skills = ROLE_SKILL_MAP.get(target_role, [])
+
+    matched_count = sum(1 for skill in role_skills if skill in lower)
+    matched_score = matched_count * 15
+
+    role_scores = infer_role_scores(job_text)
+    role_fit = role_scores.get(target_role, 0)
+    role_bonus = min(role_fit * 3, 25)
+
+    keywords = extract_keywords(job_text, top_n=30)
+    rare_keyword_count = sum(1 for kw in keywords if kw in CORE_PHRASES)
+    keyword_boost = min(rare_keyword_count * 5, 20)
+
+    raw_score = min(matched_score + role_bonus + keyword_boost, 100)
+
+    if raw_score >= 81:
+        category = "Excellent"
+    elif raw_score >= 61:
+        category = "Good"
+    elif raw_score >= 31:
+        category = "Fair"
+    else:
+        category = "Poor"
+
+    is_strong_match = raw_score >= 70
+
+    return raw_score, category, is_strong_match

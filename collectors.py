@@ -7,11 +7,14 @@ import json
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Any, list, Optional
+from typing import Any, Optional
 from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
+
+from utils import safe_get, has_visa, has_relocation, strip_html
+from config import GREENHOUSE_COMPANIES, LEVER_COMPANIES, ASHBY_COMPANIES
 
 
 class JobCollector(ABC):
@@ -70,18 +73,16 @@ class RemotiveCollector(JobCollector):
 
     def collect(self) -> list[dict[str, Any]]:
         try:
-            resp = self.session.get(
-                "https://remotive.com/api/remote-jobs", timeout=self.timeout
-            )
-            resp.raise_for_status()
+            resp = safe_get("https://remotive.com/api/remote-jobs", self.session)
+            if resp is None:
+                return []
+
             jobs = []
             for row in resp.json().get("jobs", []):
                 if not self._is_matching_title(row.get("title", "")):
                     continue
 
-                description = BeautifulSoup(
-                    row.get("description", ""), "lxml"
-                ).get_text(" ", strip=True)
+                description = strip_html(row.get("description", ""))
                 jobs.append({
                     "title": row.get("title", ""),
                     "company": row.get("company_name", ""),
@@ -91,9 +92,8 @@ class RemotiveCollector(JobCollector):
                     "description": description,
                     "published_at": row.get("publication_date", ""),
                     "remote": True,
-                    "visa_sponsorship": self._contains_keywords(
-                        description, ["visa", "sponsor", "work permit"]
-                    ),
+                    "visa_sponsorship": has_visa(description),
+                    "relocation_support": has_relocation(description),
                 })
                 if len(jobs) >= 100:
                     break
@@ -119,18 +119,16 @@ class ArbeitnowCollector(JobCollector):
 
     def collect(self) -> list[dict[str, Any]]:
         try:
-            resp = self.session.get(
-                "https://www.arbeitnow.com/api/job-board-api", timeout=self.timeout
-            )
-            resp.raise_for_status()
+            resp = safe_get("https://www.arbeitnow.com/api/job-board-api", self.session)
+            if resp is None:
+                return []
+
             jobs = []
             for row in resp.json().get("data", []):
                 if not self._is_matching_title(row.get("title", "")):
                     continue
 
-                description = BeautifulSoup(
-                    row.get("description", ""), "lxml"
-                ).get_text(" ", strip=True)
+                description = strip_html(row.get("description", ""))
                 location = row.get("location", "Not specified")
                 jobs.append({
                     "title": row.get("title", ""),
@@ -141,11 +139,10 @@ class ArbeitnowCollector(JobCollector):
                     "description": description,
                     "published_at": row.get("created_at", ""),
                     "remote": self._contains_keywords(
-                        f"{location} {description}", ["remote", "anywhere", "global"]
+                        f"{location} {description}", ["remote", "anywhere", "global", "worldwide"]
                     ),
-                    "visa_sponsorship": self._contains_keywords(
-                        description, ["visa", "sponsor", "work permit"]
-                    ),
+                    "visa_sponsorship": has_visa(description),
+                    "relocation_support": has_relocation(description),
                 })
                 if len(jobs) >= 100:
                     break
@@ -169,53 +166,15 @@ class ArbeitnowCollector(JobCollector):
 class GreenhouseCollector(JobCollector):
     """Fetch jobs from Greenhouse boards"""
 
-    COMPANIES = [
-        "aircall",
-        "airbnb",
-        "amazon",
-        "anthropic",
-        "braintrust",
-        "candela",
-        "clay",
-        "figma",
-        "generic",
-        "github",
-        "gitlab",
-        "google",
-        "guidepoint",
-        "hugging-face",
-        "intercom",
-        "loom",
-        "maker",
-        "merge",
-        "metabase",
-        "netflix",
-        "notion",
-        "openai",
-        "paddle",
-        "panther",
-        "reddit",
-        "retool",
-        "roboflow",
-        "segment",
-        "notion",
-        "slack",
-        "snowflake",
-        "stripe",
-        "supabase",
-        "vercel",
-    ]
-
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
-        for company in self.COMPANIES[:10]:  # Start with 10 companies
+        for company in GREENHOUSE_COMPANIES[:50]:  # Use config list
             try:
                 url = f"https://boards.greenhouse.io/api/v1/boards/{company}/jobs"
-                resp = self.session.get(url, timeout=self.timeout)
-                if resp.status_code == 404:
+                resp = safe_get(url, self.session)
+                if resp is None:
                     continue
 
-                resp.raise_for_status()
                 for job in resp.json().get("jobs", []):
                     if not self._is_matching_title(job.get("title", "")):
                         continue
@@ -226,9 +185,9 @@ class GreenhouseCollector(JobCollector):
                         ", ".join([l.get("name", "") for l in locations])
                         or "Not specified"
                     )
-                    description = "\n".join(
-                        [req.get("description", "") for req in job.get("content", [])]
-                    )
+                    # content is a string with HTML, not a list
+                    content = job.get("content", "")
+                    description = strip_html(content) if isinstance(content, str) else ""
 
                     all_jobs.append({
                         "title": job.get("title", ""),
@@ -239,9 +198,8 @@ class GreenhouseCollector(JobCollector):
                         "description": description,
                         "published_at": job.get("updated_at", ""),
                         "remote": "remote" in location.lower(),
-                        "visa_sponsorship": self._contains_keywords(
-                            description, ["visa", "sponsor", "work permit"]
-                        ),
+                        "visa_sponsorship": has_visa(description),
+                        "relocation_support": has_relocation(description),
                     })
                     if len(all_jobs) >= 100:
                         return all_jobs
@@ -266,34 +224,17 @@ class GreenhouseCollector(JobCollector):
 class LeverCollector(JobCollector):
     """Fetch jobs from Lever boards"""
 
-    COMPANIES = [
-        "a16z",
-        "airbnb",
-        "amazon",
-        "anthropic",
-        "github",
-        "gitlab",
-        "google",
-        "hugging-face",
-        "loom",
-        "notion",
-        "openai",
-        "retool",
-        "stripe",
-        "vercel",
-    ]
-
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
-        for company in self.COMPANIES[:8]:  # Start with 8 companies
+        for company in LEVER_COMPANIES[:50]:  # Use config list
             try:
-                url = f"https://api.lever.co/v0/postings/companies/{company}"
-                resp = self.session.get(url, timeout=self.timeout)
-                if resp.status_code == 404:
+                # Fixed API endpoint: correct is /v0/postings/{slug}?mode=json not /v0/postings/companies/{slug}
+                url = f"https://api.lever.co/v0/postings/{company}?mode=json"
+                resp = safe_get(url, self.session)
+                if resp is None:
                     continue
 
-                resp.raise_for_status()
-                for job in resp.json():
+                for job in resp.json().get("postings", []):
                     if not self._is_matching_title(job.get("text", "")):
                         continue
 
@@ -313,9 +254,8 @@ class LeverCollector(JobCollector):
                         "description": description,
                         "published_at": job.get("createdAt", ""),
                         "remote": "remote" in location.lower(),
-                        "visa_sponsorship": self._contains_keywords(
-                            description, ["visa", "sponsor", "work permit"]
-                        ),
+                        "visa_sponsorship": has_visa(description),
+                        "relocation_support": has_relocation(description),
                     })
                     if len(all_jobs) >= 100:
                         return all_jobs
@@ -340,23 +280,25 @@ class LeverCollector(JobCollector):
 class AshbyCollector(JobCollector):
     """Fetch jobs from Ashby boards"""
 
-    COMPANIES = ["company", "anthropic", "vercel", "stripe", "figma"]
-
     def collect(self) -> list[dict[str, Any]]:
         all_jobs = []
-        for company in self.COMPANIES[:5]:
+        for company in ASHBY_COMPANIES[:50]:  # Use config list, skip dummy "company" value
+            if company.lower() == "company":
+                continue
             try:
-                url = f"https://api.ashbyhq.com/posting.listByCompanyName"
-                payload = {"companyName": company, "includeCompanyName": True}
-                resp = self.session.post(url, json=payload, timeout=self.timeout)
-                resp.raise_for_status()
+                # Fixed endpoint: correct is /posting-api/job-board/{slug} not posting.listByCompanyName
+                url = f"https://api.ashbyhq.com/posting-api/job-board/{company}"
+                resp = safe_get(url, self.session, params={"includeCompanyName": True})
+                if resp is None:
+                    continue
 
-                for job in resp.json().get("results", []):
+                for job in resp.json().get("results", []) or resp.json().get("postings", []):
                     title = job.get("title", "")
                     if not self._is_matching_title(title):
                         continue
 
-                    description = job.get("descriptionHtml", "")
+                    description = job.get("descriptionHtml", "") or job.get("description", "")
+                    description = strip_html(description) if isinstance(description, str) else ""
                     location_objs = job.get("locations", [])
                     location = (
                         ", ".join([l.get("name", "") for l in location_objs])
@@ -372,9 +314,8 @@ class AshbyCollector(JobCollector):
                         "description": description,
                         "published_at": job.get("createdAt", ""),
                         "remote": "remote" in location.lower(),
-                        "visa_sponsorship": self._contains_keywords(
-                            description, ["visa", "sponsor", "work permit"]
-                        ),
+                        "visa_sponsorship": has_visa(description),
+                        "relocation_support": has_relocation(description),
                     })
                     if len(all_jobs) >= 100:
                         return all_jobs
