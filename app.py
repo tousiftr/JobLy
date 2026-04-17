@@ -97,6 +97,52 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                company TEXT,
+                location TEXT,
+                job_url TEXT,
+                source TEXT,
+                description TEXT,
+                remote INTEGER DEFAULT 0,
+                visa_sponsorship INTEGER DEFAULT 0,
+                relocation_support INTEGER DEFAULT 0,
+                ats_score REAL DEFAULT NULL,
+                ats_category TEXT,
+                role_match TEXT,
+                matched_skills TEXT,
+                top_keywords TEXT,
+                published_at TEXT,
+                scraped_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                is_tracked INTEGER DEFAULT 0
+            )
+            """
+        )
+        # Create indexes for common queries
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_jobs_visa_remote
+            ON raw_jobs(visa_sponsorship, remote)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_jobs_ats_score
+            ON raw_jobs(ats_score DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_jobs_published
+            ON raw_jobs(published_at DESC)
+            """
+        )
 
 
 init_db()
@@ -497,50 +543,239 @@ def web_jobs() -> Any:
     return jsonify({"jobs": jobs, "count": len(jobs), "warnings": warnings, "scanned_at": now_iso()})
 
 
+@app.get("/api/jobs/raw")
+def list_raw_jobs() -> Any:
+    """List raw scraped jobs with optional filtering"""
+    remote = request.args.get("remote", default=None, type=lambda x: x.lower() == "1")
+    visa = request.args.get("visa", default=None, type=lambda x: x.lower() == "1")
+    min_score = request.args.get("min_score", default=0, type=float)
+    days = request.args.get("days", default=7, type=int)
+    limit = request.args.get("limit", default=50, type=int)
+
+    query = "SELECT * FROM raw_jobs WHERE 1=1"
+    params: list[Any] = []
+
+    if remote is not None:
+        query += " AND remote = ?"
+        params.append(1 if remote else 0)
+
+    if visa is not None:
+        query += " AND visa_sponsorship = ?"
+        params.append(1 if visa else 0)
+
+    if min_score > 0:
+        query += " AND ats_score >= ?"
+        params.append(min_score)
+
+    if days > 0:
+        from datetime import datetime, timedelta, timezone
+        cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+        query += " AND published_at >= ?"
+        params.append(cutoff)
+
+    query += " ORDER BY ats_score DESC, published_at DESC LIMIT ?"
+    params.append(limit)
+
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/jobs/raw/store")
+def store_raw_job() -> Any:
+    """Store a raw job from web scraping"""
+    payload = request.get_json(silent=True) or {}
+    now = now_iso()
+
+    # Generate job_id from title+company+location hash
+    import hashlib
+    job_id = hashlib.md5(
+        f"{payload.get('title', '')}|{payload.get('company', '')}|{payload.get('location', '')}"
+        .encode()
+    ).hexdigest()
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO raw_jobs (
+                job_id, title, company, location, job_url, source, description,
+                remote, visa_sponsorship, relocation_support, ats_score, ats_category,
+                role_match, matched_skills, top_keywords, published_at, scraped_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                payload.get("title", ""),
+                payload.get("company", ""),
+                payload.get("location", ""),
+                payload.get("job_url", ""),
+                payload.get("source", ""),
+                payload.get("description", ""),
+                1 if payload.get("remote") else 0,
+                1 if payload.get("visa_sponsorship") else 0,
+                1 if payload.get("relocation_support") else 0,
+                payload.get("ats_score"),
+                payload.get("ats_category"),
+                payload.get("role_match", ""),
+                json.dumps(payload.get("matched_skills", [])),
+                json.dumps(payload.get("top_keywords", [])),
+                payload.get("published_at", ""),
+                now,
+                now,
+                now,
+            ),
+        )
+
+    return jsonify({"id": job_id, "message": "Stored"}), 201
+
+
+@app.patch("/api/jobs/raw/<job_id>/track")
+def move_raw_to_tracker(job_id: str) -> Any:
+    """Move a raw job to user's tracker"""
+    with get_conn() as conn:
+        # Get raw job
+        raw = conn.execute(
+            "SELECT * FROM raw_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+
+        if not raw:
+            return jsonify({"error": "Job not found"}), 404
+
+        # Insert into tracked_jobs
+        now = now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO tracked_jobs (
+                title, company, location, job_url, status, remote, visa_sponsorship,
+                notes, target_role, top_keywords, matched_skills, missing_skills,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                raw["title"],
+                raw["company"],
+                raw["location"],
+                raw["job_url"],
+                "Saved",
+                raw["remote"],
+                raw["visa_sponsorship"],
+                f"ATS: {raw['ats_score']}/100 - {raw['ats_category']}" if raw["ats_score"] else "",
+                raw["role_match"],
+                raw["top_keywords"],
+                raw["matched_skills"],
+                "",  # missing_skills
+                now,
+                now,
+            ),
+        )
+
+        # Mark as tracked
+        conn.execute(
+            "UPDATE raw_jobs SET is_tracked = 1, updated_at = ? WHERE job_id = ?",
+            (now, job_id),
+        )
+
+    return jsonify({"message": "Moved to tracker", "tracked_id": cur.lastrowid})
+
+
 HTML = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>JobLy — Personal Job Portal + ATS Resume Assistant</title>
+  <title>JobLy — Personal Job Search & ATS Assistant</title>
   <style>
-    :root{--bg:#0b1020;--card:#131b34;--line:#273256;--txt:#e6ecff;--muted:#93a2d1;--accent:#4ade80;--accent2:#60a5fa}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 Inter,Segoe UI,Arial,sans-serif}
-    .wrap{max-width:1200px;margin:auto;padding:18px}
-    h1{margin:.2rem 0 0;font-size:1.6rem} h2{margin:0 0 .7rem;font-size:1.1rem}
-    .sub{color:var(--muted);margin:.3rem 0 1rem}
-    .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:14px} @media(max-width:980px){.grid{grid-template-columns:1fr}}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-    label{display:block;margin:.65rem 0 .25rem;color:#c7d4ff;font-size:.85rem}
-    input,textarea,select{width:100%;padding:10px;border-radius:8px;border:1px solid #32406c;background:#0c142a;color:var(--txt)}
-    textarea{min-height:150px;resize:vertical}
-    button{background:var(--accent);color:#062010;border:none;border-radius:8px;padding:10px 14px;font-weight:700;cursor:pointer}
-    button.secondary{background:#233154;color:#cfe0ff;border:1px solid #32406c}
-    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-    .stat{padding:10px;border:1px solid #334270;border-radius:8px;background:#0e1732;min-width:130px}
-    .stat b{font-size:1.15rem;display:block}
-    .pill{display:inline-block;padding:3px 8px;margin:2px;border:1px solid #3d4f85;border-radius:999px;font-size:.8rem;background:#0d1631}
-    .list{max-height:260px;overflow:auto;border:1px solid #344471;border-radius:8px;padding:8px;background:#0b1329}
-    table{width:100%;border-collapse:collapse} th,td{border-bottom:1px solid #2a385f;padding:8px;text-align:left;vertical-align:top}
-    th{color:#b6c6f7;font-size:.8rem} .muted{color:var(--muted)} .ok{color:var(--accent)} .warn{color:#facc15}
-    a{color:var(--accent2)}
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #ffffff; color: #1a1a1a; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    header { border-bottom: 1px solid #e5e5e5; padding: 24px 0; margin-bottom: 32px; }
+    h1 { font-size: 32px; font-weight: 600; color: #1a1a1a; margin-bottom: 8px; }
+    .tagline { font-size: 15px; color: #666; }
+    h2 { font-size: 20px; font-weight: 600; color: #1a1a1a; margin: 24px 0 16px 0; }
+    h3 { font-size: 14px; font-weight: 600; color: #1a1a1a; margin: 16px 0 12px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; margin-bottom: 32px; }
+    @media(max-width: 1024px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: #f9f9f9; border: 1px solid #e5e5e5; border-radius: 8px; padding: 24px; }
+    .card.white { background: #ffffff; }
+
+    label { display: block; font-size: 13px; font-weight: 500; color: #666; margin: 16px 0 6px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+    input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #e5e5e5; border-radius: 6px; font-size: 14px; font-family: inherit; margin-bottom: 12px; }
+    input:focus, textarea:focus, select:focus { outline: none; border-color: #0066cc; box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.1); }
+    textarea { min-height: 120px; resize: vertical; }
+
+    button { background: #0066cc; color: white; border: none; border-radius: 6px; padding: 10px 16px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background 0.2s; }
+    button:hover { background: #0052a3; }
+    button.secondary { background: transparent; color: #0066cc; border: 1px solid #0066cc; }
+    button.secondary:hover { background: rgba(0, 102, 204, 0.05); }
+    button.small { padding: 6px 12px; font-size: 13px; }
+
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; margin-bottom: 12px; }
+    .row > div { flex: 1; min-width: 200px; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+    .stat { background: white; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px; text-align: center; }
+    .stat-label { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .stat-value { font-size: 24px; font-weight: 600; color: #0066cc; }
+
+    .filters { background: white; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+    .filter-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .checkbox-group { display: flex; gap: 16px; align-items: center; }
+    .checkbox { display: flex; align-items: center; gap: 6px; }
+    input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+
+    .tag { display: inline-block; background: #e5f0ff; color: #0066cc; padding: 4px 12px; border-radius: 20px; font-size: 13px; margin: 2px 4px 2px 0; }
+    .tag.strong { background: #0066cc; color: white; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #f0f0f0; text-align: left; padding: 12px; font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e5e5e5; }
+    td { padding: 12px; border-bottom: 1px solid #f0f0f0; }
+    tr:hover { background: #fafafa; }
+
+    .job-title { font-weight: 600; color: #0066cc; }
+    .job-subtitle { font-size: 13px; color: #999; margin-top: 4px; }
+
+    .ats-score { display: inline-block; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+    .ats-score.poor { background: #ffe5e5; color: #d32f2f; }
+    .ats-score.fair { background: #fff3e0; color: #f57f17; }
+    .ats-score.good { background: #e8f5e9; color: #388e3c; }
+    .ats-score.excellent { background: #d4edda; color: #155724; }
+
+    .list { max-height: 300px; overflow-y: auto; border: 1px solid #e5e5e5; border-radius: 6px; }
+    .list-item { padding: 12px; border-bottom: 1px solid #f0f0f0; font-size: 13px; font-family: "Monaco", monospace; }
+    .list-item:last-child { border-bottom: none; }
+
+    .no-data { text-align: center; color: #999; padding: 32px; }
+    .error { color: #d32f2f; padding: 12px; background: #ffebee; border-radius: 6px; }
+    .success { color: #155724; padding: 12px; background: #d4edda; border-radius: 6px; }
+
+    a { color: #0066cc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>JobLy — Smart Personal Career Assistant</h1>
-    <p class="sub">Built for Data Analyst, Analytics Engineer, and Data Engineer roles with focus on remote + visa sponsorship opportunities for a Bangladeshi applicant.</p>
+  <header>
+    <div class="container">
+      <h1>JobLy</h1>
+      <p class="tagline">Smart job search & ATS-optimized resume assistant for Data Analysts, Analytics Engineers, and Data Engineers</p>
+    </div>
+  </header>
 
+  <div class="container">
+    <!-- Job Analyzer Section -->
     <div class="grid">
       <section class="card">
-        <h2>1) Job Analyzer + ATS Resume Tailoring</h2>
+        <h2>Analyze Job Posting</h2>
         <label>Job URL (optional)</label>
-        <input id="job_url" placeholder="https://jobs.lever.co/..." />
-        <label>or Job Description</label>
-        <textarea id="job_text" placeholder="Paste full JD here"></textarea>
+        <input id="job_url" placeholder="https://jobs.lever.co/company/job-id" />
+        <label>Or paste job description</label>
+        <textarea id="job_text" placeholder="Paste the full job description here..."></textarea>
         <div class="row">
-          <div style="flex:1;min-width:200px">
+          <div>
             <label>Target Role</label>
             <select id="target_role">
               <option>Data Analyst</option>
@@ -548,57 +783,90 @@ HTML = """
               <option>Data Engineer</option>
             </select>
           </div>
-          <div style="flex:2;min-width:240px">
-            <label>Your Current Skills (comma-separated)</label>
+          <div>
+            <label>Your Skills (comma-separated)</label>
             <input id="user_skills" placeholder="SQL, Python, dbt, Tableau, GA4" />
           </div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <button onclick="analyzeJob()">Analyze + Tailor Resume</button>
+        <div class="row">
+          <button onclick="analyzeJob()">Analyze Job</button>
           <button class="secondary" onclick="saveFromAnalysis()">Save to Tracker</button>
         </div>
-
-        <div id="analysis" style="margin-top:14px"></div>
+        <div id="analysis" style="margin-top: 24px;"></div>
       </section>
 
-      <aside class="card">
-        <h2>2) Tracker Snapshot</h2>
-        <div id="stats" class="row"></div>
-        <p class="muted" style="margin:.7rem 0 .4rem">Status to use: Saved, Applied, Interview, Offer, Rejected.</p>
-        <div class="row">
-          <input id="quick_status_id" placeholder="Job ID" style="max-width:120px"/>
-          <select id="quick_status" style="max-width:160px">
-            <option>Saved</option><option>Applied</option><option>Interview</option><option>Offer</option><option>Rejected</option>
-          </select>
-          <button class="secondary" onclick="updateStatus()">Update</button>
+      <section class="card">
+        <h2>Dashboard</h2>
+        <div class="stats" id="stats"></div>
+        <div style="margin-top: 20px;">
+          <label>Update Job Status</label>
+          <div class="row">
+            <input id="quick_status_id" placeholder="Job ID" style="max-width: 100px;" />
+            <select id="quick_status" style="max-width: 150px;">
+              <option>Saved</option><option>Applied</option><option>Interview</option><option>Offer</option><option>Rejected</option>
+            </select>
+            <button class="secondary small" onclick="updateStatus()">Update</button>
+          </div>
         </div>
-      </aside>
+      </section>
     </div>
 
-    <section class="card" style="margin-top:14px">
-      <h2>3) Tracked Jobs Dashboard</h2>
-      <div style="overflow:auto"><table id="jobs_tbl"><thead><tr>
-        <th>ID</th><th>Role / Company</th><th>Status</th><th>Remote</th><th>Visa</th><th>Notes</th><th>Actions</th>
-      </tr></thead><tbody></tbody></table></div>
-    </section>
-
-    <section class="card" style="margin-top:14px">
-      <h2>4) Built-in Google Search Query Generator</h2>
-      <p class="muted">Use these on Google and set <b>Tools → Past week</b>; then verify each posting page for real recency and sponsorship wording.</p>
-      <div class="row"><button class="secondary" onclick="loadQueries()">Generate Queries</button></div>
-      <div id="queries" class="list" style="margin-top:10px"></div>
-    </section>
-
-    <section class="card" style="margin-top:14px">
-      <h2>5) Live Web Scraped Jobs</h2>
-      <p class="muted">Fetches current analytics/data jobs from public job-board APIs using the same title/visa/remote matching logic.</p>
-      <div class="row">
-        <button class="secondary" onclick="loadWebJobs()">Load All Jobs</button>
+    <!-- Tracked Jobs Section -->
+    <section class="card white">
+      <h2>Your Tracked Jobs</h2>
+      <div style="overflow-x: auto;">
+        <table id="jobs_tbl">
+          <thead><tr>
+            <th>ID</th><th>Role</th><th>Company</th><th>Status</th><th>Remote</th><th>Visa</th><th>Notes</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
-      <p id="web_jobs_meta" class="muted" style="margin:.7rem 0 .4rem"></p>
-      <div style="overflow:auto"><table id="web_jobs_tbl"><thead><tr>
-        <th>Role / Company</th><th>Location</th><th>Remote</th><th>Visa</th><th>Source</th><th>Published</th>
-      </tr></thead><tbody><tr><td colspan="6" class="muted">Click "Load All Jobs" to fetch listings.</td></tr></tbody></table></div>
+    </section>
+
+    <!-- Raw Jobs Section -->
+    <section class="card white">
+      <h2>Smart Job Discovery</h2>
+      <p style="color: #666; margin-bottom: 16px;">Browse automatically scraped jobs matching your criteria. Filter by remote status, visa sponsorship, and ATS score.</p>
+
+      <div class="filters">
+        <div class="filter-row">
+          <div class="checkbox-group">
+            <label class="checkbox"><input type="checkbox" id="filter_remote" /> Remote Only</label>
+            <label class="checkbox"><input type="checkbox" id="filter_visa" /> Visa Sponsorship</label>
+          </div>
+          <div>
+            <label>Min ATS Score</label>
+            <input type="number" id="filter_score" min="0" max="100" value="60" style="margin-bottom: 0;" />
+          </div>
+          <div>
+            <label>Posted (days)</label>
+            <input type="number" id="filter_days" min="1" max="30" value="7" style="margin-bottom: 0;" />
+          </div>
+          <div style="display: flex; gap: 8px; align-items: flex-end;">
+            <button onclick="loadRawJobs()">Search</button>
+            <button class="secondary" onclick="clearFilters()">Reset</button>
+          </div>
+        </div>
+      </div>
+
+      <p id="raw_jobs_meta" style="color: #999; font-size: 13px; margin-bottom: 12px;"></p>
+      <div style="overflow-x: auto;">
+        <table id="raw_jobs_tbl">
+          <thead><tr>
+            <th>Role</th><th>Company</th><th>Location</th><th>ATS Score</th><th>Remote</th><th>Visa</th><th>Posted</th><th></th>
+          </tr></thead>
+          <tbody><tr><td colspan="8" class="no-data">Click "Search" to load jobs</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Search Queries Section -->
+    <section class="card white">
+      <h2>Google Search Queries</h2>
+      <p style="color: #666; margin-bottom: 16px;">Pre-built search queries for major ATS boards. Use on Google with Tools → Past week filter.</p>
+      <button class="secondary" onclick="loadQueries()" style="margin-bottom: 16px;">Generate Queries</button>
+      <div class="list" id="queries"></div>
     </section>
   </div>
 
@@ -612,7 +880,7 @@ async function jfetch(url, opts={}) {
   return data;
 }
 
-function pills(arr){return (arr||[]).map(x=>`<span class="pill">${x}</span>`).join('') || '<span class="muted">None</span>'}
+function pills(arr){return (arr||[]).map(x=>`<span class="tag">${x}</span>`).join('') || '<span style="color:#999">None</span>'}
 
 async function analyzeJob(){
   const payload = {
@@ -625,56 +893,57 @@ async function analyzeJob(){
     const d = await jfetch('/api/analyze', {method:'POST', body: JSON.stringify(payload)});
     latestAnalysis = d;
 
-    // Determine ATS score badge color
-    let scoreColor = '#dc2626'; // Red (Poor)
-    if(d.ats_score >= 81) scoreColor = '#22c55e'; // Bright Green (Excellent)
-    else if(d.ats_score >= 61) scoreColor = '#84cc16'; // Green (Good)
-    else if(d.ats_score >= 31) scoreColor = '#eab308'; // Yellow (Fair)
+    let scoreClass = 'poor';
+    if(d.ats_score >= 81) scoreClass = 'excellent';
+    else if(d.ats_score >= 61) scoreClass = 'good';
+    else if(d.ats_score >= 31) scoreClass = 'fair';
 
     document.getElementById('analysis').innerHTML = `
-      <div style="margin-bottom:14px;padding:14px;background:rgba(255,255,255,0.05);border-radius:8px;border:2px solid ${scoreColor}">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-          <div style="font-size:48px;font-weight:bold;color:${scoreColor}">${d.ats_score}</div>
+      <div style="background: white; border: 1px solid #e5e5e5; border-radius: 8px; padding: 20px; margin-bottom: 16px;">
+        <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 16px;">
+          <div style="font-size: 48px; font-weight: 700; color: #0066cc;">${d.ats_score}</div>
           <div>
-            <div style="font-size:1.1rem;font-weight:bold;color:${scoreColor}">ATS Score: ${d.ats_category}</div>
-            <div class="muted">${d.is_strong_match ? '✓ Strong Match (70+)' : '○ Below threshold (70+)'}</div>
+            <div style="font-size: 18px; font-weight: 600;">ATS Score: <span class="ats-score ${scoreClass}">${d.ats_category}</span></div>
+            <div style="font-size: 13px; color: #666; margin-top: 4px;">${d.is_strong_match ? '✓ Strong match (70+)' : '○ Below optimal threshold'}</div>
           </div>
         </div>
+        <div>
+          <span class="tag">Role: ${d.top_role}</span>
+          <span class="tag ${d.remote_status === 'Yes' ? 'strong' : ''}">Remote: ${d.remote_status}</span>
+          <span class="tag ${d.visa_sponsorship_status === 'Yes' ? 'strong' : ''}">Visa: ${d.visa_sponsorship_status}</span>
+          <span class="tag ${d.relocation_support === 'Yes' ? 'strong' : ''}">Relocation: ${d.relocation_support}</span>
+        </div>
       </div>
-
-      <div class="row" style="margin-bottom:8px">
-        <span class="pill">Top role fit: <b>${d.top_role}</b></span>
-        <span class="pill ${d.remote_status === 'Yes' ? 'ok':'warn'}">Remote: ${d.remote_status}</span>
-        <span class="pill ${d.visa_sponsorship_status === 'Yes' ? 'ok':'warn'}">Visa: ${d.visa_sponsorship_status}</span>
-        <span class="pill ${d.relocation_support === 'Yes' ? 'ok':'warn'}">Relocation: ${d.relocation_support}</span>
-      </div>
-      <h3>Important ATS Keywords</h3><div>${pills(d.keywords.slice(0,28))}</div>
-      <h3>Matched Skills</h3><div>${pills(d.tailoring.matched_skills)}</div>
-      <h3>Potential Missing Skills</h3><div>${pills(d.tailoring.missing_skills)}</div>
-      <h3>Resume Bullet Suggestions</h3>
-      <ul>${(d.tailoring.suggested_bullets||[]).map(b=>`<li>${b}</li>`).join('')}</ul>
-      <h3>ATS Action Checklist</h3>
-      <ul>${(d.tailoring.ats_actions||[]).map(b=>`<li>${b}</li>`).join('')}</ul>
+      <h3>ATS Keywords (${d.keywords.length})</h3>
+      <div>${pills(d.keywords.slice(0, 25))}</div>
+      <h3>Matched Skills (${d.tailoring.matched_skills.length})</h3>
+      <div>${pills(d.tailoring.matched_skills)}</div>
+      <h3>Missing Skills (${d.tailoring.missing_skills.length})</h3>
+      <div>${pills(d.tailoring.missing_skills)}</div>
+      <h3>Resume Suggestions</h3>
+      <ul style="margin-left: 20px;">
+        ${(d.tailoring.suggested_bullets||[]).map(b=>`<li style="margin-bottom: 8px;">${b}</li>`).join('')}
+      </ul>
+      <h3>ATS Optimization</h3>
+      <ul style="margin-left: 20px;">
+        ${(d.tailoring.ats_actions||[]).map(b=>`<li style="margin-bottom: 8px;">${b}</li>`).join('')}
+      </ul>
     `;
   }catch(e){
-    document.getElementById('analysis').innerHTML = `<p class="warn">${e.message}</p>`;
+    document.getElementById('analysis').innerHTML = `<div class="error">Error: ${e.message}</div>`;
   }
 }
 
 async function saveFromAnalysis(){
-  if(!latestAnalysis){alert('Analyze a job first.'); return;}
+  if(!latestAnalysis){alert('Analyze a job first'); return;}
   const title = prompt('Role title:', latestAnalysis.top_role || 'Data Role');
   if(title === null) return;
-  const company = prompt('Company name:', '') ?? '';
-  const notes = prompt('Notes:', '');
+  const company = prompt('Company name:', '') || 'Unknown';
   await jfetch('/api/tracker/jobs', {method:'POST', body: JSON.stringify({
-    title, company,
-    location: '',
-    job_url: latestAnalysis.source_url || document.getElementById('job_url').value,
-    status: 'Saved',
-    remote: latestAnalysis.remote_status === 'Yes',
+    title, company, location: '', job_url: latestAnalysis.source_url || document.getElementById('job_url').value,
+    status: 'Saved', remote: latestAnalysis.remote_status === 'Yes',
     visa_sponsorship: latestAnalysis.visa_sponsorship_status === 'Yes',
-    notes: notes ? `[ATS: ${latestAnalysis.ats_score}/100 - ${latestAnalysis.ats_category}] ${notes}` : `ATS: ${latestAnalysis.ats_score}/100 - ${latestAnalysis.ats_category}`,
+    notes: `ATS: ${latestAnalysis.ats_score}/100 - ${latestAnalysis.ats_category}`,
     target_role: document.getElementById('target_role').value,
     top_keywords: latestAnalysis.keywords?.slice(0,15) || [],
     matched_skills: latestAnalysis.tailoring?.matched_skills || [],
@@ -682,27 +951,23 @@ async function saveFromAnalysis(){
   })});
   await loadJobs();
   await loadStats();
-  alert('Saved to tracker.');
+  alert('Saved to tracker');
 }
 
 async function loadJobs(){
-  const rows = await jfetch('/api/tracker/jobs');
-  const tb = document.querySelector('#jobs_tbl tbody');
-  tb.innerHTML = rows.map(r=>{
-    return `<tr>
-      <td>${r.id}</td>
-      <td><b>${r.title}</b><div class="muted">${r.company || ''} ${r.job_url ? `· <a href="${r.job_url}" target="_blank">link</a>`:''}</div></td>
-      <td>${r.status}</td>
-      <td>${r.remote ? 'Yes':'No'}</td>
-      <td>${r.visa_sponsorship ? 'Yes':'No'}</td>
-      <td>${(r.notes||'').slice(0,80)}</td>
-      <td><button class="secondary" onclick="delJob(${r.id})">Delete</button></td>
-    </tr>`;
-  }).join('') || '<tr><td colspan="7" class="muted">No tracked jobs yet.</td></tr>';
+  try {
+    const rows = await jfetch('/api/tracker/jobs');
+    const tb = document.querySelector('#jobs_tbl tbody');
+    tb.innerHTML = rows.length ? rows.map(r=>`<tr>
+      <td>${r.id}</td><td class="job-title">${r.title}</td><td>${r.company || ''}</td>
+      <td>${r.status}</td><td>${r.remote ? 'Yes':'No'}</td><td>${r.visa_sponsorship ? 'Yes':'No'}</td>
+      <td>${(r.notes||'').slice(0,50)}</td><td><button class="secondary small" onclick="delJob(${r.id})">Delete</button></td>
+    </tr>`).join('') : '<tr><td colspan="8" class="no-data">No tracked jobs yet</td></tr>';
+  } catch(e) { console.error(e); }
 }
 
 async function delJob(id){
-  if(!confirm('Delete this tracked job?')) return;
+  if(!confirm('Delete this job?')) return;
   await jfetch(`/api/tracker/jobs/${id}`, {method:'DELETE'});
   await loadJobs();
   await loadStats();
@@ -718,46 +983,82 @@ async function updateStatus(){
 }
 
 async function loadStats(){
-  const s = await jfetch('/api/tracker/stats');
-  document.getElementById('stats').innerHTML = `
-    <div class="stat"><span>Total</span><b>${s.total}</b></div>
-    <div class="stat"><span>Applied</span><b>${s.applied}</b></div>
-    <div class="stat"><span>Interview</span><b>${s.interview}</b></div>
-    <div class="stat"><span>Remote</span><b>${s.remote}</b></div>
-    <div class="stat"><span>Visa</span><b>${s.visa_sponsorship}</b></div>
-  `;
+  try {
+    const s = await jfetch('/api/tracker/stats');
+    document.getElementById('stats').innerHTML = `
+      <div class="stat"><div class="stat-label">Total</div><div class="stat-value">${s.total}</div></div>
+      <div class="stat"><div class="stat-label">Applied</div><div class="stat-value">${s.applied}</div></div>
+      <div class="stat"><div class="stat-label">Interviews</div><div class="stat-value">${s.interview}</div></div>
+      <div class="stat"><div class="stat-label">Remote</div><div class="stat-value">${s.remote}</div></div>
+      <div class="stat"><div class="stat-label">Visa Support</div><div class="stat-value">${s.visa_sponsorship}</div></div>
+    `;
+  } catch(e) { console.error(e); }
+}
+
+async function loadRawJobs(){
+  const remote = document.getElementById('filter_remote').checked ? '1' : '';
+  const visa = document.getElementById('filter_visa').checked ? '1' : '';
+  const min_score = document.getElementById('filter_score').value || '0';
+  const days = document.getElementById('filter_days').value || '7';
+
+  const meta = document.getElementById('raw_jobs_meta');
+  const body = document.querySelector('#raw_jobs_tbl tbody');
+  meta.textContent = 'Loading...';
+
+  try{
+    const url = new URL('/api/jobs/raw', window.location);
+    if(remote) url.searchParams.set('remote', '1');
+    if(visa) url.searchParams.set('visa', '1');
+    if(min_score) url.searchParams.set('min_score', min_score);
+    if(days) url.searchParams.set('days', days);
+
+    const d = await jfetch(url.toString());
+    meta.textContent = `Found ${d.length} jobs matching your criteria`;
+    body.innerHTML = d.length ? d.map(j=>{
+      let scoreClass = 'poor';
+      if(j.ats_score >= 81) scoreClass = 'excellent';
+      else if(j.ats_score >= 61) scoreClass = 'good';
+      else if(j.ats_score >= 31) scoreClass = 'fair';
+
+      return `<tr>
+        <td class="job-title">${j.title}</td><td>${j.company || ''}</td><td>${j.location || ''}</td>
+        <td><span class="ats-score ${scoreClass}">${j.ats_score ? j.ats_score.toFixed(0) : 'N/A'}</span></td>
+        <td>${j.remote ? 'Yes' : 'No'}</td><td>${j.visa_sponsorship ? 'Yes' : 'No'}</td>
+        <td style="font-size: 12px; color: #999;">${j.published_at ? new Date(j.published_at).toLocaleDateString() : ''}</td>
+        <td><button class="secondary small" onclick="moveToTracker('${j.job_id}')">Save</button></td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="8" class="no-data">No jobs found. Try adjusting filters.</td></tr>';
+  }catch(e){
+    meta.textContent = `Error: ${e.message}`;
+    body.innerHTML = '<tr><td colspan="8" class="error">Failed to load jobs</td></tr>';
+  }
+}
+
+async function moveToTracker(jobId){
+  try{
+    await jfetch(`/api/jobs/raw/${jobId}/track`, {method:'PATCH'});
+    alert('Job saved to tracker');
+    await loadJobs();
+    await loadStats();
+  }catch(e){
+    alert(`Error: ${e.message}`);
+  }
+}
+
+function clearFilters(){
+  document.getElementById('filter_remote').checked = false;
+  document.getElementById('filter_visa').checked = false;
+  document.getElementById('filter_score').value = '60';
+  document.getElementById('filter_days').value = '7';
 }
 
 async function loadQueries(){
-  const d = await jfetch('/api/search-queries');
-  const q = document.getElementById('queries');
-  q.innerHTML = d.queries.map(x=>`<div style="padding:6px 4px;border-bottom:1px solid #26345a"><code>${x}</code></div>`).join('');
-}
-
-async function loadWebJobs(){
-  const meta = document.getElementById('web_jobs_meta');
-  const body = document.querySelector('#web_jobs_tbl tbody');
-  meta.textContent = 'Loading jobs from web sources...';
-  body.innerHTML = '<tr><td colspan="6" class="muted">Loading...</td></tr>';
   try{
-    const d = await jfetch('/api/web-jobs');
-    meta.textContent = `Found ${d.count} jobs · scanned at ${new Date(d.scanned_at).toLocaleString()}`;
-    if((d.warnings||[]).length){
-      meta.textContent += ` · warnings: ${d.warnings.join(' | ')}`;
-    }
-    body.innerHTML = (d.jobs||[]).map(j=>{
-      return `<tr>
-        <td><b>${j.title}</b><div class="muted">${j.company || ''} ${j.job_url ? `· <a href="${j.job_url}" target="_blank">link</a>`:''}</div></td>
-        <td>${j.location || ''}</td>
-        <td>${j.remote ? 'Yes':'No'}</td>
-        <td>${j.visa_sponsorship ? 'Mentioned':'No'}</td>
-        <td>${j.source || ''}</td>
-        <td>${j.published_at || ''}</td>
-      </tr>`;
-    }).join('') || '<tr><td colspan="6" class="muted">No matching jobs found right now.</td></tr>';
+    const d = await jfetch('/api/search-queries');
+    const q = document.getElementById('queries');
+    q.innerHTML = d.queries.map(x=>`<div class="list-item">${x}</div>`).join('');
   }catch(e){
-    meta.textContent = `Failed to load web jobs: ${e.message}`;
-    body.innerHTML = '<tr><td colspan="6" class="warn">Could not fetch web jobs right now.</td></tr>';
+    q.innerHTML = `<div class="error">Error: ${e.message}</div>`;
   }
 }
 
