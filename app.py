@@ -930,6 +930,7 @@ HTML = """
           <div style="display: flex; gap: 8px; align-items: flex-end;">
             <button onclick="loadRawJobs()">Search</button>
             <button class="secondary" onclick="clearFilters()">Reset</button>
+            <button class="secondary" onclick="scrapeJobsNow()" id="scrape_btn">Scrape Jobs Now</button>
           </div>
         </div>
       </div>
@@ -1119,6 +1120,28 @@ async function loadRawJobs(){
   }catch(e){
     meta.textContent = `Error: ${e.message}`;
     body.innerHTML = '<tr><td colspan="8" class="error">Failed to load jobs</td></tr>';
+  }
+}
+
+async function scrapeJobsNow(){
+  const btn = document.getElementById('scrape_btn');
+  const meta = document.getElementById('raw_jobs_meta');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Scraping... (30-90 sec)';
+  meta.textContent = 'Fetching jobs from Remotive, Arbeitnow, Greenhouse, Lever, Ashby...';
+  try{
+    const r = await fetch('/api/scraper/run-now', {method:'POST', headers:{'Content-Type':'application/json'}});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    showToast(`✓ Scraped ${d.jobs_collected} jobs, stored ${d.jobs_stored}`);
+    await loadRawJobs();
+  }catch(e){
+    meta.textContent = `Scrape failed: ${e.message}`;
+    showToast(`✗ ${e.message}`);
+  }finally{
+    btn.disabled = false;
+    btn.textContent = original;
   }
 }
 
